@@ -1,0 +1,14 @@
+build/
+out/
+*.o
+*.obj
+*.a
+*.so
+*.dylib
+*.dll
+*.exe
+compile_commands.json
+.cache/
+.vscode/
+.idea/
+vmlinux.h

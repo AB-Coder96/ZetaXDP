@@ -1,139 +1,176 @@
-# Core
+    # ZetaXDP — Kernel-Bypass UDP Ingest (AF_XDP)
 
-- C++20 (userspace ingest loop + generator)
+    ZetaXDP is a focused systems project exploring **kernel-bypass UDP ingest** using **AF_XDP**. The goal is to demonstrate the exact performance work HFT teams care about:
 
-- CMake
+    - fast, predictable packet ingest (**pps + tail latency**)
+    - correctness under load (**loss detection**, gaps, counters)
+    - reproducible benchmarks (**p99/p99.9**, commit tracking)
+    - profiling-driven tuning (**perf**, CPU affinity, cache effects)
 
-- Linux-only
+    **Scope note:** ZetaXDP is a transport/ingest prototype intended for learning and measurement. It is not represented as a production trading connector.
 
-- libbpf / bpftool (for XDP program build/loading)
+    ## Core constraints
 
-- AF_XDP with UMEM + RX rings
+    - **C++20**, userspace ingest loop + generator
+    - **CMake**
+    - **Linux-only**
+    - **libbpf / bpftool** (for XDP program build/loading)
+    - **AF_XDP** with UMEM + RX rings
 
-# Tooling
+    ## Tooling
 
-- clang for eBPF/XDP program (if you include the kernel-side XDP prog)
+    - `clang` (for eBPF/XDP program build)
+    - `ip link`, `ethtool`, `tc`, `bpftool`
+    - `perf` for profiling
 
-- ip link, ethtool, tc, bpftool
+    ## Architecture
 
-- perf for profiling
+    ```
+    NIC RX
+      ↓
+    XDP program (attach to interface)
+      ↓
+    UMEM frames (copy vs zero-copy)
+      ↓
+    AF_XDP RX ring → userspace poll loop
+      ↓
+    Parser (UDP payload decode)
+      ↓
+    Lock-free ring buffer (optional / stubbed in MVP)
+      ↓
+    Downstream pipeline (book builder / replay / recorder)
+    ```
 
-- Provide a baseline kernel UDP socket ingest in same repo
+    ## Modes
 
-- Packet generator with sequence numbers
+    - **Baseline**: kernel UDP socket ingest (comparison point)
+    - **AF_XDP copy**: AF_XDP path with copy semantics (portable)
+    - **AF_XDP zero-copy**: target path (when supported by driver/NIC)
 
-- CSV export for p50/p99/p99.9 + pps
+    ## What it measures
 
-# ZetaXDP — Kernel-Bypass UDP Ingest (AF_XDP)
+    ### Performance
 
-ZetaXDP is a focused systems project exploring **kernel-bypass UDP ingest** using **AF_XDP**. The goal is to demonstrate the exact performance work HFT teams care about:
+    - packets/sec (pps)
+    - p50/p99/p99.9 ingest loop latency (**RX → parse → commit**) in **nanoseconds**
+    - CPU utilization per thread / core
+    - cache miss / branch stats (`perf`)
 
-- fast, predictable packet ingest (pps + tail latency)
-- correctness under load (loss detection, gaps, counters)
-- reproducible benchmarks (p99/p99.9, commit tracking)
-- profiling-driven tuning (perf, CPU affinity, cache effects)
+    ### Correctness / loss diagnostics
 
-> **Scope note:** ZetaXDP is a transport/ingest prototype intended for learning and measurement. It is not represented as a production trading connector.
+    - sequence-gap detector (per flow) if payload includes sequence numbers
+    - ring saturation / UMEM pressure indicators (fill ring starvation)
+    - drop counters (socket drops, XDP/driver drops when available)
+    - optional “debug mirror” hooks (future extension)
 
----
+    ### Reproducible benchmarking discipline
 
-## Architecture
+    Every run records:
 
-```
-NIC RX
-  ↓
-XDP program (attach to interface)
-  ↓
-UMEM frames (copy vs zero-copy)
-  ↓
-AF_XDP RX ring → userspace poll loop
-  ↓
-Parser (UDP payload decode)
-  ↓
-Lock-free ring buffer
-  ↓
-Downstream pipeline (book builder / replay / recorder)
-```
+    - **config hash** (mode, batch, ring sizes, busy-poll, etc.)
+    - generator parameters (packet size, rate, flows, seed)
+    - compile-time **git SHA** (if built from a git checkout)
+    - machine profile (kernel, CPU model, governor hint)
 
-### Modes
-- **Baseline:** kernel UDP socket recv loop (comparison point)
-- **AF_XDP copy:** AF_XDP path with copy semantics
-- **AF_XDP zero-copy:** target path (when supported by driver/NIC)
+    Recommended run checklist:
 
----
+    - pin threads to cores (affinity)
+    - warm up before measurement
+    - fixed payload sizes / fixed generator seeds
+    - Release builds only
+    - export CSV for dashboards
 
-## What it measures
+    ## Quickstart
 
-### Performance
-- packets/sec (pps)
-- p50/p99/p99.9 ingest latency (timestamped at receive + stage timing)
-- CPU utilization per thread / core
-- cache miss / branch stats (perf)
+    ### Dependencies (Ubuntu-ish)
 
-### Correctness / loss diagnostics
-- sequence-gap detector (per flow) if payload includes sequence numbers
-- ring saturation / UMEM pressure indicators
-- drop counters across layers (NIC / XDP / socket)
-- jitter + timestamp skew tracker
-- optional PCAP mirror/debug mode
+    ```
+    sudo apt-get update
+    sudo apt-get install -y build-essential cmake clang llvm pkg-config \
+      libbpf-dev libelf-dev zlib1g-dev linux-tools-common linux-tools-$(uname -r) \
+      bpftool ethtool iproute2
+    ```
 
----
+    > Your distro package names may differ. On some distros you may need to build libbpf from source.
 
-## Reproducible benchmarking discipline
+    ### Build
 
-Every benchmark run is stored with:
-- config hash (mode, batch size, busy-poll, ring sizes)
-- dataset generator parameters (packet size, rate, flows)
-- commit SHA
-- machine profile (CPU, kernel, governor)
+    ```
+    mkdir -p build && cd build
+    cmake .. -DCMAKE_BUILD_TYPE=Release
+    cmake --build . -j
+    ```
 
-Recommended run checklist:
-- pin threads to cores (affinity)
-- warm up before measurement
-- fixed payload sizes / fixed generator seeds
-- release builds only
-- export CSV for dashboards
+    This builds:
+    - `zetaxdp` (receiver / benchmark runner)
+    - `zetagen` (UDP packet generator)
+    - `xdp/zeta_xdp_kern.o` (XDP program object) if `clang` is available
 
----
+    ### Run (baseline vs AF_XDP)
 
-## Quickstart (example)
+    Baseline socket ingest:
+    ```
+    sudo ./zetaxdp --mode socket --iface eth0 --port 9000 --seconds 30 --out out/socket.csv
+    ```
 
-### Build
-```bash
-mkdir -p build && cd build
-cmake .. -DCMAKE_BUILD_TYPE=Release
-cmake --build . -j
-```
+    AF_XDP copy mode:
+    ```
+    sudo ./zetaxdp --mode xdp_copy --iface eth0 --queue 0 --seconds 30 --out out/xdp_copy.csv
+    ```
 
-### Run (baseline vs AF_XDP)
-```bash
-# baseline socket ingest
-./ZetaXDP --mode socket --iface eth0 --port 9000 --seconds 30 --out out/socket.csv
+    AF_XDP zero-copy mode (if supported):
+    ```
+    sudo ./zetaxdp --mode xdp_zc --iface eth0 --queue 0 --seconds 30 --out out/xdp_zc.csv
+    ```
 
-# AF_XDP copy
-./ZetaXDP --mode xdp_copy --iface eth0 --queue 0 --seconds 30 --out out/xdp_copy.csv
+    Generator (send to the same host):
+    ```
+    ./zetagen --dst 127.0.0.1 --port 9000 --seconds 30 --size 128 --rate_pps 2000000 --flows 1
+    ```
 
-# AF_XDP zero-copy (if supported)
-./ZetaXDP --mode xdp_zc --iface eth0 --queue 0 --seconds 30 --out out/xdp_zc.csv
-```
+    ## CSV output
 
----
+    `zetaxdp` emits a single summary row by default:
 
-## What to publish on your portfolio page
+    - `measured_pps`
+    - `p50_ns`, `p99_ns`, `p999_ns`
+    - `rx_pkts`, `gaps`
+    - `config_hash`, `git_sha`, `kernel`, `cpu_model`
 
-Include:
-1) **pps + p99/p99.9** for socket vs XDP copy vs XDP zero-copy
-2) a one-paragraph explanation of **what changed** to move the tail (affinity, batching, ring sizes, busy-poll)
-3) a screenshot or snippet of a **perf top** showing the hot path
-4) a “loss dashboard” screenshot proving **0.00% drops** under your test load
+    You can extend it to emit per-second time series (`--timeseries out.csv`) if desired.
 
----
+    ## Profiling tips
 
-## Roadmap (credible extensions)
-- add AF_XDP TX path for loopback tests
-- add AF_PACKET mmap baseline (another comparison)
-- add an eBPF stats exporter (periodic counters)
-- integrate results into **ZetaPulse** dashboard
-- add CI perf regression (store last-known-good p99)
+    - Disable frequency scaling (set `performance` governor) and isolate cores if you can.
+    - Pin the RX thread:
+      ```
+      sudo ./zetaxdp ... --cpu 2
+      ```
+    - Profile hot path:
+      ```
+      sudo perf top -p $(pidof zetaxdp)
+      sudo perf record -F 999 -g -- ./zetaxdp ...
+      sudo perf report
+      ```
 
----
+    ## What to publish on your portfolio page
+
+    Include:
+
+    - pps + p99/p99.9 for socket vs XDP copy vs XDP zero-copy
+    - one paragraph on what moved the tail (affinity, batching, ring sizes, busy-poll)
+    - a perf screenshot/snippet showing the hot path
+    - a “loss dashboard” screenshot proving 0.00% drops under your test load
+
+    ## Roadmap (credible extensions)
+
+    - add AF_XDP TX path for loopback tests
+    - add AF_PACKET mmap baseline (another comparison)
+    - add an eBPF stats exporter (periodic counters)
+    - integrate results into ZetaPulse dashboard
+    - add CI perf regression (store last-known-good p99)
+
+    ## Notes
+
+    - Latency metrics in this MVP are **userspace ingest-loop latency** (receive → parse → commit), not end-to-end network latency.
+    - Zero-copy support depends on driver/NIC; see kernel docs and `ethtool -i`.
